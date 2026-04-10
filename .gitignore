@@ -2,3 +2,4 @@ dataset/
 env/
 *.pdf
 checkpoints/
+*.zip
