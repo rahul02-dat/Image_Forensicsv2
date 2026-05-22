@@ -6,6 +6,7 @@ import torchvision.models as tvm
 import torchvision.transforms as T
 from PIL import Image
 import numpy as np
+import cv2
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 IMG_SIZE = 224
@@ -19,7 +20,89 @@ VAL_TRANSFORM = T.Compose([
 ])
 
 
+# ── TTA transform variants used at inference ──────────────────────────────────
+TTA_TRANSFORMS = [
+    T.Compose([
+        T.Resize((IMG_SIZE, IMG_SIZE)),
+        T.ToTensor(),
+        T.Normalize(MEAN, STD),
+    ]),
+    T.Compose([
+        T.Resize((256, 256)),
+        T.CenterCrop(IMG_SIZE),
+        T.ToTensor(),
+        T.Normalize(MEAN, STD),
+    ]),
+    T.Compose([
+        T.Resize((IMG_SIZE, IMG_SIZE)),
+        T.RandomHorizontalFlip(p=1.0),
+        T.ToTensor(),
+        T.Normalize(MEAN, STD),
+    ]),
+]
+
+
+# ── Social-media compression helpers ─────────────────────────────────────────
+
+def estimate_jpeg_quality(pil_img: Image.Image) -> int:
+    """
+    Heuristic JPEG quality estimate via quantization table if available.
+    Falls back to 75 (mid-quality) when tables are absent (e.g. PNG input).
+    """
+    try:
+        qtables = getattr(pil_img, "quantization", None)
+        if qtables:
+            avg_q = int(np.mean(list(qtables[0].values())))
+            if avg_q <= 8:  return 95
+            if avg_q <= 16: return 80
+            if avg_q <= 24: return 70
+            if avg_q <= 48: return 55
+            return 40
+    except Exception:
+        pass
+    return 75  # assume mid-quality if unknown
+
+
+def social_media_preprocess(pil_img: Image.Image) -> Image.Image:
+    """
+    Detect if the image looks like it came through social-media compression
+    (WhatsApp / Instagram / Telegram) and apply mild unsharp masking to
+    partially recover high-frequency detail lost during recompression.
+
+    This runs BEFORE the standard normalization transform so the model
+    sees partially restored textures rather than blurred DCT artefacts.
+    """
+    quality = estimate_jpeg_quality(pil_img)
+    img_np = np.array(pil_img.convert("RGB"), dtype=np.uint8)
+
+    if quality < 80:
+        # Unsharp mask: recovers edge / frequency detail destroyed by JPEG
+        # sigma tuned so it doesn't introduce ringing on very low quality images
+        sigma = max(0.8, 2.0 - quality / 80.0)   # 0.8–1.2 for q 55–79
+        blur  = cv2.GaussianBlur(img_np, (0, 0), sigmaX=sigma)
+        strength = min(0.5, (80 - quality) / 60.0)  # 0.0–0.5 proportional boost
+        img_np = cv2.addWeighted(img_np, 1.0 + strength, blur, -strength, 0)
+        img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+
+    return Image.fromarray(img_np)
+
+
+# ── Model components ──────────────────────────────────────────────────────────
+
 class PatchDCT(nn.Module):
+    """
+    Splits image into non-overlapping patches, applies 2-D DCT per patch,
+    then stacks the coefficient planes as a multi-channel feature map.
+
+    Change vs original: we now skip the DC + 4 lowest-frequency coefficients
+    (indices 0-3) and use the mid-frequency band (4 : 4+top_k).  Mid-frequency
+    coefficients survive JPEG compression far better than the very lowest ones,
+    yet still carry the GAN / diffusion fingerprints that the original top-k
+    approach targeted.
+    """
+
+    DCT_SKIP = 4   # skip DC + 3 lowest AC coefficients
+
     def __init__(self, patch_size: int = 8, top_k: int = 32):
         super().__init__()
         self.p = patch_size
@@ -41,14 +124,16 @@ class PatchDCT(nn.Module):
                         )
         self.register_buffer("kernel", basis.view(N * N, 1, N, N))
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         p = self.p
         x_flat = x.view(B * C, 1, H, W)
         dct = F.conv2d(x_flat, self.kernel, stride=p)
         _, _, Hf, Wf = dct.shape
         dct = dct.view(B, C, p * p, Hf, Wf)
-        dct = dct[:, :, :self.k, :, :]
+        # Mid-frequency band: skip DC + lowest-freq, more robust to JPEG
+        s = self.DCT_SKIP
+        dct = dct[:, :, s:s + self.k, :, :]
         return dct.reshape(B, C * self.k, Hf, Wf)
 
 
@@ -63,7 +148,7 @@ class FreqStream(nn.Module):
         )
         self.proj = nn.Linear(512, out_dim)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.proj(self.encoder(x).flatten(1))
 
 
@@ -80,7 +165,7 @@ class CrossModalAttention(nn.Module):
         self.norm_s = nn.LayerNorm(hidden)
         self.norm_f = nn.LayerNorm(hidden)
 
-    def forward(self, fs, ff):
+    def forward(self, fs: torch.Tensor, ff: torch.Tensor):
         gate_sf = torch.sigmoid(
             (self.q_s(fs) * self.k_f(ff)).sum(dim=-1, keepdim=True) * self.scale
         )
@@ -113,7 +198,7 @@ class DualStreamForensicNet(nn.Module):
             nn.Linear(256, num_classes),
         )
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         fs  = self.spatial_pool(self.spatial_feat(x)).flatten(1)
         fs  = self.spatial_proj(fs)
         dct = self.patch_dct(x)
@@ -121,6 +206,8 @@ class DualStreamForensicNet(nn.Module):
         fs_att, ff_att = self.fusion(fs, ff)
         return self.head(torch.cat([fs_att, ff_att], dim=1)).squeeze(1)
 
+
+# ── Inference engine ──────────────────────────────────────────────────────────
 
 class InferenceEngine:
     def __init__(self, checkpoint_path: str):
@@ -132,9 +219,34 @@ class InferenceEngine:
         print(f"Model loaded from epoch {ckpt['epoch']}  (AUC {ckpt['best_auc']:.4f})")
 
     def preprocess(self, pil_image: Image.Image) -> torch.Tensor:
-        return VAL_TRANSFORM(pil_image.convert("RGB")).unsqueeze(0).to(self.device)
+        """Standard single-view preprocessing (used for GradCAM)."""
+        img = social_media_preprocess(pil_image)
+        return VAL_TRANSFORM(img.convert("RGB")).unsqueeze(0).to(self.device)
 
     @torch.no_grad()
     def predict(self, tensor: torch.Tensor) -> float:
+        """Single-view prediction. Prefer predict_tta for production use."""
         logit = self.model(tensor)
         return torch.sigmoid(logit).item()
+
+    @torch.no_grad()
+    def predict_tta(self, pil_image: Image.Image, n_views: int = 3) -> float:
+        """
+        Test-Time Augmentation prediction.
+        Averages sigmoid probabilities over `n_views` augmented crops/flips of
+        the preprocessed image, reducing sensitivity to WhatsApp resampling.
+
+        Args:
+            pil_image: Raw PIL image (before any transform).
+            n_views:   How many TTA views to average (default 3 — matches
+                       TTA_TRANSFORMS length; set lower to trade accuracy for speed).
+        Returns:
+            P(AI-generated) in [0, 1].
+        """
+        img = social_media_preprocess(pil_image).convert("RGB")
+        probs = []
+        for tfm in TTA_TRANSFORMS[:n_views]:
+            tensor = tfm(img).unsqueeze(0).to(self.device)
+            logit  = self.model(tensor)
+            probs.append(torch.sigmoid(logit).item())
+        return float(sum(probs) / len(probs))
