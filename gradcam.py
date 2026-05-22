@@ -39,12 +39,10 @@ class GradCAM:
         self.model.zero_grad()
         logit.backward()
 
-        # Global average pool the gradients → channel weights
-        weights = self._grads.mean(dim=(2, 3), keepdim=True)   # (1, C, 1, 1)
-        cam = (weights * self._acts).sum(dim=1, keepdim=True)  # (1, 1, H, W)
+        weights = self._grads.mean(dim=(2, 3), keepdim=True)
+        cam = (weights * self._acts).sum(dim=1, keepdim=True)
         cam = F.relu(cam)
 
-        # Normalise to [0, 1]
         cam -= cam.min()
         if cam.max() > 0:
             cam /= cam.max()
@@ -54,16 +52,12 @@ class GradCAM:
         return cam.squeeze().cpu().float().numpy()
 
 
-def heatmap_overlay(pil_image: "Image.Image", cam: np.ndarray, alpha: float = 0.45) -> str:
+def heatmap_overlay(pil_image: Image.Image, cam: np.ndarray, alpha: float = 0.45) -> str:
     """Blend GradCAM heatmap onto the original image; return base64 PNG string."""
     img = np.array(pil_image.convert("RGB").resize((224, 224)))
-
-    # Apply colormap (COLORMAP_INFERNO looks great for forensics)
     heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_INFERNO)
     heatmap = cv2.cvtColor(heatmap, cv2.COLOR_BGR2RGB)
-
     blended = (alpha * heatmap + (1 - alpha) * img).astype(np.uint8)
-
     buf = io.BytesIO()
     Image.fromarray(blended).save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode()
