@@ -58,17 +58,19 @@ async def predict(file: UploadFile = File(...)):
     if file.content_type not in allowed:
         raise HTTPException(415, f"Unsupported file type: {file.content_type}")
 
-    raw = await file.read()
+    raw     = await file.read()
     pil_img = Image.open(io.BytesIO(raw)).convert("RGB")
 
-    tensor = engine.preprocess(pil_img)
-    prob   = engine.predict(tensor)                  # P(AI-generated)
+    # ── TTA prediction (robust to WhatsApp / social-media recompression) ──────
+    # predict_tta applies social_media_preprocess internally, then averages
+    # probabilities over 3 augmented views (resize, center-crop, h-flip).
+    prob = engine.predict_tta(pil_img, n_views=3)   # P(AI-generated)
 
     label      = "AI-GENERATED" if prob > 0.5 else "REAL"
     confidence = prob * 100 if prob > 0.5 else (1 - prob) * 100
 
-    # GradCAM (re-run with grad enabled)
-    cam_tensor  = engine.preprocess(pil_img)
+    # ── GradCAM (single forward pass with grad enabled, uses preprocessed img) ─
+    cam_tensor  = engine.preprocess(pil_img)   # social_media_preprocess applied here too
     cam         = gcam.generate(cam_tensor)
     gradcam_b64 = heatmap_overlay(pil_img, cam)
 
@@ -83,11 +85,11 @@ async def predict(file: UploadFile = File(...)):
     )
 
     return {
-        "id":           pred_id,
-        "label":        label,
-        "confidence":   round(confidence, 2),
-        "raw_prob":     round(prob, 4),
-        "gradcam_b64":  gradcam_b64,
+        "id":            pred_id,
+        "label":         label,
+        "confidence":    round(confidence, 2),
+        "raw_prob":      round(prob, 4),
+        "gradcam_b64":   gradcam_b64,
         "thumbnail_b64": thumb_b64,
     }
 
