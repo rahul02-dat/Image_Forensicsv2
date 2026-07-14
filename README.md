@@ -1,13 +1,3 @@
----
-title: Image Forensics v2
-emoji: 🔬
-colorFrom: gray
-colorTo: green
-sdk: docker
-pinned: false
-app_port: 7860
----
-
 # Image Forensics v2
 
 This project provides a robust solution to distinguish real photographs from AI-generated images (created via GANs, Stable Diffusion, Midjourney, etc.). It is trained on the [GenImage](https://github.com/GenImage-Dataset/GenImage) dataset and specifically designed to be resilient against social media compression.
